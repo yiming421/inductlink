@@ -21,11 +21,11 @@ def random_split_edges(data, val_ratio=0.05, test_ratio=0.1):
 
 def load_data(dataset):
     if dataset in ['Cora', 'CiteSeer', 'PubMed']:
-        data = Planetoid(root='dataset', name=dataset)
+        dataset = Planetoid(root='dataset', name=dataset)
     elif dataset in ['CS', 'Physics']:
-        data = Coauthor(root='dataset', name=dataset)
+        dataset = Coauthor(root='dataset', name=dataset)
     elif dataset in ['Computers', 'Photo']:
-        data = Amazon(root='dataset', name=dataset)
+        dataset = Amazon(root='dataset', name=dataset)
     data = dataset[0]
     split_edge = random_split_edges(data)
     data.edge_index = to_undirected(split_edge['train']['edge'].t())
@@ -83,14 +83,23 @@ def load_other_data(dataset):
 
     return data, split_edge
 
-def load_all_train_data():
+def load_all_train_data_no_feat():
     data_list = []
     split_edge_list = []
-    for dataset in ['Ecoli', 'Yeast', 'NS', 'PB', 'Power', 'Router', 'USAir', 'Celegans']:
+    for dataset in ['Ecoli', 'Yeast', 'NS', 'PB', 'Power', 'USAir', 'Celegans']:
         if dataset == 'ogbl-ppa':
             data, split_edge = load_ogbl_data('ogbl-ppa')
         else:
             data, split_edge = load_other_data(dataset)
+        data_list.append(data)
+        split_edge_list.append(split_edge)
+    return data_list, split_edge_list
+
+def load_all_train_data_feat():
+    data_list = []
+    split_edge_list = []
+    for dataset in ['Cora', 'CiteSeer', 'PubMed', 'CS', 'Physics', 'Computers', 'Photo']:
+        data, split_edge = load_data(dataset)
         data_list.append(data)
         split_edge_list.append(split_edge)
     return data_list, split_edge_list

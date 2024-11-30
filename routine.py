@@ -5,7 +5,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-def train(model, pred, optimizer, data, split_edge, args): # consider loss biased issue
+def train(model, pred, optimizer, data, split_edge, args, clip_emb=False): # consider loss biased issue
     model.train()
     pred.train()
 
@@ -45,17 +45,17 @@ def train(model, pred, optimizer, data, split_edge, args): # consider loss biase
 
         nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
         nn.utils.clip_grad_norm_(pred.parameters(), args.clip_grad_norm)
-        if args.learnable_emb:
+        if clip_emb:
             nn.utils.clip_grad_norm_(data.x, args.clip_grad_norm)
 
         optimizer.step()
         tot_loss.append(loss.item())
     return sum(tot_loss) / len(tot_loss)
 
-def train_multiple(model, pred, optimizer, data, split_edge, args):
+def train_multiple(model, pred, optimizer, data, split_edge, args, clip_emb=False):
     tot_loss = 0
     for d, s in zip(data, split_edge):
-        loss = train(model, pred, optimizer, d, s, args)
+        loss = train(model, pred, optimizer, d, s, args, clip_emb)
         tot_loss += loss
     return tot_loss / len(data)
 

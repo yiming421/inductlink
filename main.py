@@ -1,7 +1,8 @@
 import argparse
 import torch
-from data import load_data, load_ogbl_data, load_other_data, load_all_train_data
-from model import inductive_GCN, DotPredictor, LorentzPredictor, LinearPredictor, CosinePredictor, Hadamard_MLPPredictor, ManhattanPredictor, inductive_GCN_no_feat, inductive_GCN_feat
+from data import load_data, load_ogbl_data, load_other_data, load_all_train_data_no_feat, load_all_train_data_feat
+from model import inductive_GCN, DotPredictor, LorentzPredictor, LinearPredictor, CosinePredictor, Hadamard_MLPPredictor, ManhattanPredictor, \
+    inductive_GCN_no_feat, inductive_GCN_feat
 import numpy as np
 from torch_geometric.utils import negative_sampling, add_self_loops
 from torch_geometric.data import DataLoader
@@ -19,7 +20,8 @@ import cupyx.scipy.sparse.linalg as linalg
 import copy
 from torch_geometric.nn import Node2Vec
 
-datasets_all = ['Ecoli', 'Yeast', 'NS', 'PB', 'Power', 'Router', 'USAir', 'Celegans']
+datasets_all_no_feat = ['Ecoli', 'Yeast', 'NS', 'PB', 'Power', 'USAir', 'Celegans']
+datasets_all_feat = ['Cora', 'CiteSeer', 'PubMed', 'CS', 'Physics', 'Computers', 'Photo']
 
 def set_seed(seed):
     torch.manual_seed(seed)
@@ -73,8 +75,20 @@ def pca(data, hidden):
     A = sp.coo_matrix((d, (row, col)), shape=(data.num_nodes, data.num_nodes))
     A = A - A.mean(axis=0)
     st = time.time()
-    u, _, _ = linalg.svds(A, k=hidden)
-    feat = A @ u[:, :hidden]
+    u, sigma, _ = linalg.svds(A, k=hidden)
+    feat = u @ cp.diag(sigma)
+    print(time.time() - st, flush=True)
+    data.x = torch.tensor(feat, dtype=torch.float32)
+
+def pca_feat(data, hidden):
+    A = cp.array(data.x)
+    A = A - A.mean(axis=0)
+    A = A / A.std(axis=0)
+
+    st = time.time()
+    u, sigma, _ = linalg.svds(A, k=hidden)
+    print(A.shape, u.shape, flush=True)
+    feat = u @ cp.diag(sigma)
     print(time.time() - st, flush=True)
     data.x = torch.tensor(feat, dtype=torch.float32)
     
@@ -88,13 +102,13 @@ def eigen(data, hidden):
     print(time.time() - st, flush=True)
     data.x = torch.tensor(eigenvectors[1], dtype=torch.float32)
 
-def node2vec(edge_index, num_nodes, hidden, device, batch_size, lr, emb_epochs=100):
+def node2vec(edge_index, num_nodes, hidden, device):
     st = time.time()
     model = Node2Vec(edge_index, embedding_dim=hidden, walk_length=20, context_size=10, walks_per_node=10, num_negative_samples=1, p=1, q=1, sparse=True).to(device)
-    loader = model.loader(batch_size=batch_size, shuffle=True, num_workers=4)
-    optimizer = torch.optim.SparseAdam(list(model.parameters()), lr=lr).to(device)
+    loader = model.loader(batch_size=128, shuffle=True, num_workers=4)
+    optimizer = torch.optim.SparseAdam(list(model.parameters()), lr=0.01)
     model.train()
-    for epoch in range(emb_epochs):
+    for epoch in range(100):
         total_loss = 0
         for pos_rw, neg_rw in loader:
             optimizer.zero_grad()
@@ -103,7 +117,7 @@ def node2vec(edge_index, num_nodes, hidden, device, batch_size, lr, emb_epochs=1
             optimizer.step()
             total_loss += loss.item()
         print(f'Node2Vec Epoch: {epoch:03d}, Loss: {total_loss / len(loader):.4f}')
-    return model(torch.arange(num_nodes, device=device))
+    return model(torch.arange(num_nodes, device=device)).detach()
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Inductlink')
@@ -114,7 +128,7 @@ def parse_args():
     parser.add_argument('--num_layers', type=int, default=15)
     parser.add_argument('--alpha', type=float, default=0.5)
     parser.add_argument('--epochs', type=int, default=500)
-    parser.add_argument('--test_epochs', type=int, default=100)
+    parser.add_argument('--test_epochs', type=int, default=0)
     parser.add_argument('--lr', type=float, default=0.0004)
     parser.add_argument('--batch_size', type=int, default=16384)
     parser.add_argument('--metric', type=str, default='Hits@50')
@@ -138,9 +152,10 @@ def parse_args():
     parser.add_argument('--initial_emb', type=str, default='noise')
     parser.add_argument('--loss_fn', type=str, default='bce')
     parser.add_argument('--rand_noise', action='store_true', default=False)
+    parser.add_argument('--agg_type', type=str, default='add_att')
     return parser.parse_args()
 
-def init_emb(data, args):
+def init_emb(data, args, device):
     if args.initial_emb == 'eigen':
         eigen(data, args.hidden)
     elif args.initial_emb == 'pca':
@@ -152,9 +167,47 @@ def init_emb(data, args):
         torch.nn.init.xavier_uniform_(embedding.weight)
         data.x = embedding.weight
     elif args.initial_emb == 'node2vec':
-        data.x = node2vec(data.edge_index, data.num_nodes, args.hidden)
+        data.x = node2vec(data.edge_index, data.num_nodes, args.hidden, device)
     else:
         raise ValueError('Invalid initial embedding type')
+    
+def unify_dim(data, hidden, device, multiple=False):
+    if multiple:
+        for d in data:
+            if d.x.shape[1] > hidden:
+                pca_feat(d, hidden)
+            elif d.x.shape[1] < hidden:
+                n = hidden // d.x.shape[1] + 1
+                d.x = torch.cat([d.x for _ in range(n)], dim=1)
+                pca_feat(d, hidden)
+            d = d.to(device)
+    else:
+        if data.x.shape[1] > hidden:
+            pca_feat(data, hidden)
+        elif data.x.shape[1] < hidden:
+            n = hidden // data.x.shape[1] + 1
+            data.x = torch.cat([data.x for _ in range(n)], dim=1)
+            pca_feat(data, hidden)
+        data = data.to(device)
+
+def test_learnable_emb(model, pred, data, split_edge, evaluator, batch_size, device, args):
+    embedding = nn.Embedding(data.num_nodes, args.hidden).to(device)
+    torch.nn.init.xavier_uniform_(embedding.weight)
+    data.x = embedding.weight
+    data = data.to(device)
+
+    optimizer = torch.optim.Adam(embedding.parameters(), lr=args.lr)
+
+    for i in range(args.test_epochs):
+        loss = train(model, pred, optimizer, data, split_edge, args, True)
+        print(f'Test epoch: {i:03d}, Loss: {loss:.4f}')
+        results = test(model, pred, data, split_edge, evaluator, batch_size, args)
+        for key, result in results.items():
+            train_hits, valid_hits, test_hits = result
+            print(f'Train: {train_hits:.4f}, Valid: {valid_hits:.4f}, Test: {test_hits:.4f}')
+            if key == args.metric:
+                print(key, f'Test: {test_hits:.4f}')
+        print('---------------------------------')
 
 def main():
     args = parse_args()
@@ -163,22 +216,26 @@ def main():
     device = torch.device(f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu')
     cp.cuda.Device(args.gpu).use()
 
-    if args.train_dataset in ['Cora', 'CiteSeer', 'PubMed']:
+    if args.train_dataset in ['Cora', 'CiteSeer', 'PubMed', 'CS', 'Physics', 'Computers', 'Photo']:
         data, split_edge = load_data(args.train_dataset)
         data = data.to(device)
     elif args.train_dataset in ['ogbl-collab', 'ogbl-ddi', 'ogbl-ppa', 'ogbl-citation2']:
         data, split_edge = load_ogbl_data(args.train_dataset)
         if args.train_dataset == 'ogbl-ppa' or args.train_dataset == 'ogbl-ddi':
-            init_emb(data, args)
+            init_emb(data, args, device)
         data = data.to(device)
-    elif args.train_dataset == 'all':
-        data, split_edge = load_all_train_data()
+    elif args.train_dataset == 'all_no_feat':
+        data, split_edge = load_all_train_data_no_feat()
         for d in data:
-            init_emb(d, args)
+            init_emb(d, args, device)
+            d = d.to(device)
+    elif args.train_dataset == 'all_feat':
+        data, split_edge = load_all_train_data_feat()
+        for d in data:
             d = d.to(device)
     else:
         data, split_edge = load_other_data(args.train_dataset)
-        embedding = init_emb(data, args)
+        embedding = init_emb(data, args, device)
         data = data.to(device)
 
     if args.lda:
@@ -186,14 +243,20 @@ def main():
         data.x = linklda(data.x, data.edge_index, 32)
     
     if args.pca:
-        data.x = pca(data.x, 96)
+        pca_feat(data, 96)
 
     if args.model == 'no-feat':
         model = inductive_GCN_no_feat(args.num_layers, args.hidden, args.residual, args.dropout, args.relu, args.linear, args.conv).to(device)
     elif args.model == 'feat':
-        model = inductive_GCN_feat(args.num_layers, data.x.shape[1], args.hidden, args.dropout, args.relu, args.linear, args.conv).to(device)
+        if args.train_dataset == 'all_feat':
+            model = inductive_GCN_feat(args.num_layers, args.hidden, args.hidden, args.dropout, args.relu, args.linear, args.conv).to(device)
+            unify_dim(data, args.hidden, device, True)
+        else:
+            model = inductive_GCN_feat(args.num_layers, data.x.shape[1], args.hidden, args.dropout, args.relu, args.linear, args.conv).to(device)
+    elif args.model == 'light':
+        model = inductive_GCN(args.num_layers, args.alpha, args.dropout, agg_type=args.agg_type).to(device)
     else:
-        model = inductive_GCN(args.num_layers, args.alpha, data.x.shape[1], args.hidden, args.linear, args.dropout).to(device)
+        raise ValueError('Invalid model type')
 
     if args.pred == 'Dot':
         pred = DotPredictor().to(device)
@@ -229,26 +292,28 @@ def main():
 
     for epoch in range(1, 1 + args.epochs):
         if args.rand_noise:
-            if args.train_dataset == 'all':
+            if args.train_dataset == 'all_no_feat':
                 for d in data:
                     embedding = nn.Embedding(d.num_nodes, args.hidden)
                     torch.nn.init.xavier_uniform_(embedding.weight)
                     d.x = embedding.weight
+                    d = d.to(device)
             else:
                 embedding = nn.Embedding(data.num_nodes, args.hidden)
                 torch.nn.init.xavier_uniform_(embedding.weight)
                 data.x = embedding.weight
+                data = data.to(device)
         st = time.time()
-        if args.train_dataset == 'all':
-            loss = train_multiple(model, pred, optimizer, data, split_edge, args)
+        if args.train_dataset == 'all_no_feat' or args.train_dataset == 'all_feat':
+            loss = train_multiple(model, pred, optimizer, data, split_edge, args, args.learnable_emb)
         else:
-            loss = train(model, pred, optimizer, data, split_edge, args)
+            loss = train(model, pred, optimizer, data, split_edge, args, args.learnable_emb)
         if args.step_lr_decay and epoch % 100 == 0:
             adjustlr(optimizer, epoch / args.epochs, args.lr)
         print(f'Epoch: {epoch:03d}, Loss: {loss:.4f}')
         print(f'Train Time: {time.time() - st:.4f}')
         st = time.time()
-        if args.train_dataset == 'all':
+        if args.train_dataset == 'all_no_feat' or args.train_dataset == 'all_feat':
             results_list = test_all(model, pred, data, split_edge, evaluator, args.batch_size, args)
             results = results_list[0]
         else:
@@ -257,9 +322,13 @@ def main():
         if best_results is None:
             best_results = {key: [0, 0, 0] for key in results}
         avg_results = {key: [1, 1, 1] for key in results}
-        if args.train_dataset == 'all':
+        if args.train_dataset == 'all_no_feat' or args.train_dataset == 'all_feat':
             for i in range(len(results_list)):
-                print(datasets_all[i])
+                if args.train_dataset == 'all_no_feat':
+                    print(f'Dataset: {datasets_all_no_feat[i]}')
+                else:
+                    print(f'Dataset: {datasets_all_feat[i]}')
+
                 for key, result in results_list[i].items():
                     train_hits, valid_hits, test_hits = result
                     avg_results[key][0] *= train_hits
@@ -302,7 +371,6 @@ def main():
 
     print(f'Final results: val {best_results[args.metric][1]:.4f}, test {best_results[args.metric][2]:.4f}')
 
-
     if args.test_mode:
         model.load_state_dict(best_model)
         pred.load_state_dict(best_pred)
@@ -312,13 +380,9 @@ def main():
                 args.dataset = dataset
                 data, split_edge = load_data(args.dataset)
                 data = data.to(device)
-                for i in range(1, 1 + args.test_epochs):
-                    results = test(model, pred, data, split_edge, evaluator, args.batch_size, args)
-                    for key, result in results.items():
-                        train_hits, valid_hits, test_hits = result
-                        print(f'{dataset} {key}: Train: {train_hits:.4f}, Valid: {valid_hits:.4f}, Test: {test_hits:.4f}')
-                    print('---------------------------------')
-                results = test(model, pred, data, split_edge, evaluator, args.batch_size)
+                if args.model == 'feat':
+                    unify_dim(data, args.hidden, device, False)
+                results = test(model, pred, data, split_edge, evaluator, args.batch_size, args)
                 for key, result in results.items():
                     train_hits, valid_hits, test_hits = result
                     print(f'{dataset} {key}: Train: {train_hits:.4f}, Valid: {valid_hits:.4f}, Test: {test_hits:.4f}')
@@ -326,7 +390,11 @@ def main():
         elif args.test_dataset in ['ogbl-collab', 'ogbl-ddi', 'ogbl-ppa', 'ogbl-citation2']:
             data, split_edge = load_ogbl_data(args.test_dataset)
             if args.test_dataset == 'ogbl-ppa' or args.test_dataset == 'ogbl-ddi':
-                init_emb(data, args)
+                init_emb(data, args, device)
+                if args.test_epochs > 0:
+                    test_learnable_emb(model, pred, data, split_edge, evaluator, args.batch_size, device, args)
+            if args.model == 'feat':
+                unify_dim(data, args.hidden, device, False)
 
             data = data.to(device)
             if args.test_dataset == 'ogbl-citation2':
@@ -337,9 +405,22 @@ def main():
                 train_hits, valid_hits, test_hits = result
                 print(f'{args.test_dataset} {key}: Train: {train_hits:.4f}, Valid: {valid_hits:.4f}, Test: {test_hits:.4f}')
             print('---------------------------------')
+        elif args.test_dataset in ['Cora', 'CiteSeer', 'PubMed']:
+            data, split_edge = load_data(args.test_dataset)
+            if args.model == 'feat':
+                unify_dim(data, args.hidden, device, False)
+
+            data = data.to(device)
+            results = test(model, pred, data, split_edge, evaluator, args.batch_size, args)
+            for key, result in results.items():
+                train_hits, valid_hits, test_hits = result
+                print(f'{args.test_dataset} {key}: Train: {train_hits:.4f}, Valid: {valid_hits:.4f}, Test: {test_hits:.4f}')
+            print('---------------------------------')
         else:
             data, split_edge = load_other_data(args.test_dataset)
-            init_emb(data, args)
+            init_emb(data, args, device)
+            if args.test_epochs > 0:
+                test_learnable_emb(model, pred, data, split_edge, evaluator, args.batch_size, device, args)
 
             data = data.to(device)
             print(data.x.max(), data.x.min(), data.x.mean(), data.x.std(), flush=True)

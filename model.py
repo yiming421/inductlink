@@ -8,7 +8,7 @@ from torch_geometric.nn import MessagePassing
 from torch_geometric.nn.conv.gcn_conv import gcn_norm
 from torch_sparse import matmul
 from torch_sparse.matmul import spmm_add
-from util import adjoverlap
+from util import adjoverlap, get_entropy_normed_cond_gaussian_prob
 
 class LinearPredictor(nn.Module):
     def __init__(self, in_channels):
@@ -51,7 +51,7 @@ class LorentzPredictor(nn.Module):
         return x
 
 class Hadamard_MLPPredictor(nn.Module):
-    def __init__(self, h_feats, dropout, layer=3, res=False):
+    def __init__(self, h_feats, dropout, layer=2, res=False):
         super().__init__()
         self.lins = torch.nn.ModuleList()
         self.lins.append(torch.nn.Linear(h_feats, h_feats))
@@ -123,23 +123,82 @@ class NCNPredictor(nn.Module):
 
     def forward(self, x, adj_t, tar_ei):
         return self.multidomainforward(x, adj_t, tar_ei)
-
-class inductive_GCN(MessagePassing):
-    def __init__(self, layers, alpha, in_channels, out_channels, linear=False, dropout=0.2):
-        super(inductive_GCN, self).__init__(aggr='add')
-        self.layers = layers
-        self.alpha = alpha
-        self.alphas = Parameter(torch.Tensor(alpha ** np.arange(layers + 1)), requires_grad=True)
-        self.linear = nn.Linear(in_channels, out_channels) if linear else nn.Identity()
+    
+class MLP(nn.Module):
+    def __init__(self, in_channels, hidden_channels, out_channels, num_layers, dropout):
+        super(MLP, self).__init__()
+        self.lins = torch.nn.ModuleList()
+        self.lins.append(torch.nn.Linear(in_channels, hidden_channels))
+        for _ in range(num_layers - 2):
+            self.lins.append(torch.nn.Linear(hidden_channels, hidden_channels))
+        self.lins.append(torch.nn.Linear(hidden_channels, out_channels))
         self.dropout = dropout
 
+    def forward(self, x):
+        for lin in self.lins[:-1]:
+            x = lin(x)
+            x = F.relu(x)
+            x = F.dropout(x, p=self.dropout, training=self.training)
+        x = self.lins[-1](x)
+        return x
+
+class inductive_GCN(MessagePassing):
+    def __init__(self, layers, alpha=0.5, dropout=0.2, mlp_layers=2, mlp_hidden=256, att_temp=1, entropy=1, agg_type='add_att'):
+        super(inductive_GCN, self).__init__(aggr='add')
+        self.layers = layers
+        self.agg_type = agg_type
+        if agg_type == 'add_att':
+            self.alpha = alpha
+            self.alphas = Parameter(torch.Tensor(alpha ** np.arange(layers + 1)), requires_grad=True)
+        elif agg_type == 'mlp_att':
+            self.dim = layers * (layers + 1)
+            self.mlp = MLP(self.dim, mlp_hidden, self.layers + 1, mlp_layers, dropout)
+            self.att_temp = att_temp
+            self.entropy = entropy
+        elif agg_type == 'transformer_att':
+            raise NotImplementedError
+        else:
+            raise ValueError('Unknown aggregation type')
+        
+    def compute_dist(self, y_feat):
+        bsz, n_channel, n_class = y_feat.shape
+        # Conditional gaussian probability
+        cond_gaussian_prob = np.zeros((bsz, n_channel, n_channel))
+        for i in range(bsz):
+            cond_gaussian_prob[i, :, :] = get_entropy_normed_cond_gaussian_prob(
+                y_feat[i, :, :].cpu().numpy(), self.entropy
+            )
+
+        # Compute pairwise distances between channels n_channels(n_channels-1)/2 total features
+        dist = np.zeros((bsz, self.dim), dtype=np.float32)
+
+        pair_index = 0
+        for c in range(n_channel):
+            for c_prime in range(n_channel):
+                if c != c_prime:  # Diagonal distances are useless
+                    dist[:, pair_index] = cond_gaussian_prob[:, c, c_prime]
+                    pair_index += 1
+
+        dist = torch.from_numpy(dist).to(y_feat.device)
+        return dist
+
     def forward(self, x, adj_t, edge_weight=None):
+        xs = []
         adj_t = gcn_norm(adj_t, edge_weight, adj_t.size(0), dtype=float)
-        res = x * self.alphas[0]
+        xs.append(x)
         for i in range(self.layers):
             x = self.propagate(adj_t, x=x, edge_weight=edge_weight, size=None)
-            res = x * self.alphas[i + 1] + res
-        res = self.linear(res)
+            xs.append(x)
+        if self.agg_type == 'add_att':
+            res = xs[0] * self.alphas[0]
+            for i in range(self.layers):
+                res = res + xs[i + 1] * self.alphas[i + 1]
+        elif self.agg_type == 'mlp_att':
+            y_feat = torch.stack(xs, dim=1)
+            dist = self.compute_dist(y_feat)
+            att = self.mlp(dist)
+            att = torch.softmax(att / self.att_temp, dim=-1)
+            res = torch.sum(y_feat * att.unsqueeze(2), dim=1)
         return res
     
     def message_and_aggregate(self, adj_t, x, edge_weight):

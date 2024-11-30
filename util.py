@@ -3,7 +3,31 @@ from torch_sparse import SparseTensor
 from torch import Tensor
 import torch_sparse
 from typing import List, Tuple
+import numpy as np
+from scipy.spatial.distance import pdist, squareform
+from sklearn.manifold._utils import (
+    _binary_search_perplexity as sklearn_binary_search_perplexity,
+)
 
+def get_entropy_normed_cond_gaussian_prob(X, entropy, metric="euclidean"):
+    """
+    Parameters
+    ----------
+    X:              The matrix for pairwise similarity
+    entropy:     Perplexity of the conditional prob distribution
+    Returns the entropy-normalized conditional gaussian probability based on distances.
+    -------
+    """
+
+    # Compute pairwise distances
+    perplexity = np.exp2(entropy)
+    distances = pdist(X, metric=metric)
+    distances = squareform(distances)
+
+    # Compute the squared distances
+    distances **= 2
+    distances = distances.astype(np.float32)
+    return sklearn_binary_search_perplexity(distances, perplexity, verbose=0)
 
 class PermIterator:
     '''
@@ -252,17 +276,3 @@ def adjoverlap(adj1: SparseTensor,
         if cnsampledeg > 0:
             adjoverlap = sparsesample_reweight(adjoverlap, cnsampledeg)
     return adjoverlap
-
-
-if __name__ == "__main__":
-    adj1 = SparseTensor.from_edge_index(
-        torch.LongTensor([[0, 0, 1, 2, 3], [0, 1, 1, 2, 3]]))
-    adj2 = SparseTensor.from_edge_index(
-        torch.LongTensor([[0, 3, 1, 2, 3], [0, 1, 1, 2, 3]]))
-    adj3 = SparseTensor.from_edge_index(
-        torch.LongTensor([[0, 1,  2, 2, 2,2, 3, 3, 3], [1, 0,  2,3,4, 5, 4, 5, 6]]))
-    print(spmnotoverlap_(adj1, adj2))
-    print(spmoverlap_(adj1, adj2))
-    print(spmoverlap_notoverlap_(adj1, adj2))
-    print(sparsesample2(adj3, 2))
-    print(sparsesample_reweight(adj3, 2))
