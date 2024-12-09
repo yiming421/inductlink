@@ -1,8 +1,7 @@
 import argparse
 import torch
 from data import load_data, load_ogbl_data, load_other_data, load_all_train_data_no_feat, load_all_train_data_feat
-from model import inductive_GCN, DotPredictor, LorentzPredictor, LinearPredictor, CosinePredictor, Hadamard_MLPPredictor, ManhattanPredictor, \
-    inductive_GCN_no_feat, inductive_GCN_feat
+from model import MPLPNodeLabel, NodeFeat, UniPred
 import numpy as np
 from torch_geometric.utils import negative_sampling, add_self_loops
 from torch_geometric.data import DataLoader
@@ -132,7 +131,7 @@ def parse_args():
     parser.add_argument('--lr', type=float, default=0.0004)
     parser.add_argument('--batch_size', type=int, default=16384)
     parser.add_argument('--metric', type=str, default='Hits@50')
-    parser.add_argument('--pred', type=str, default='Linear')
+    parser.add_argument('--pred', type=str, default='Dot')
     parser.add_argument('--hidden', type=int, default=512)
     parser.add_argument('--linear', action='store_true', default=False)
     parser.add_argument('--dropout', type=float, default=0.2)
@@ -245,41 +244,12 @@ def main():
     if args.pca:
         pca_feat(data, 96)
 
-    if args.model == 'no-feat':
-        model = inductive_GCN_no_feat(args.num_layers, args.hidden, args.residual, args.dropout, args.relu, args.linear, args.conv).to(device)
-    elif args.model == 'feat':
-        if args.train_dataset == 'all_feat':
-            model = inductive_GCN_feat(args.num_layers, args.hidden, args.hidden, args.dropout, args.relu, args.linear, args.conv).to(device)
-            unify_dim(data, args.hidden, device, True)
-        else:
-            model = inductive_GCN_feat(args.num_layers, data.x.shape[1], args.hidden, args.dropout, args.relu, args.linear, args.conv).to(device)
-    elif args.model == 'light':
-        model = inductive_GCN(args.num_layers, args.alpha, args.dropout, agg_type=args.agg_type).to(device)
-    else:
-        raise ValueError('Invalid model type')
-
-    if args.pred == 'Dot':
-        pred = DotPredictor().to(device)
-    elif args.pred == 'Lorentz':
-        pred = LorentzPredictor().to(device)
-    elif args.pred == 'Linear':
-        pred = LinearPredictor(data.x.shape[1]).to(device)
-    elif args.pred == 'Hadamard':
-        pred = Hadamard_MLPPredictor(args.hidden, args.dropout, args.mlp_layers, args.res).to(device)
-    elif args.pred == 'Cosine':
-        pred = CosinePredictor().to(device)
-    elif args.pred == 'Manhattan':
-        pred = ManhattanPredictor().to(device)
-    else:
-        raise ValueError('Invalid predictor type')
+    HOP = 3
+    linklabeler = MPLPNodeLabel(256, hop=HOP)
+    nodefeater = NodeFeat(HOP)
+    model = UniPred(HOP, 1, 32).to(device)
     
-    params = list(model.parameters()) + list(pred.parameters())
-    if args.learnable_emb:
-        embedding = nn.Embedding(data.num_nodes, args.hidden).to(device)
-        torch.nn.init.xavier_uniform_(embedding.weight)
-        data.x = embedding.weight
-        params += list(embedding.parameters())
-
+    params = list(model.parameters())
     optimizer = torch.optim.Adam(params, lr=args.lr)
     evaluator = Evaluator(name='ogbl-ppa')
 
@@ -305,19 +275,19 @@ def main():
                 data = data.to(device)
         st = time.time()
         if args.train_dataset == 'all_no_feat' or args.train_dataset == 'all_feat':
-            loss = train_multiple(model, pred, optimizer, data, split_edge, args, args.learnable_emb)
+            loss = train_multiple((linklabeler, nodefeater), model, optimizer, data, split_edge, args, args.learnable_emb)
         else:
-            loss = train(model, pred, optimizer, data, split_edge, args, args.learnable_emb)
+            loss = train((linklabeler, nodefeater), model, optimizer, data, split_edge, args, args.learnable_emb)
         if args.step_lr_decay and epoch % 100 == 0:
             adjustlr(optimizer, epoch / args.epochs, args.lr)
         print(f'Epoch: {epoch:03d}, Loss: {loss:.4f}')
         print(f'Train Time: {time.time() - st:.4f}')
         st = time.time()
         if args.train_dataset == 'all_no_feat' or args.train_dataset == 'all_feat':
-            results_list = test_all(model, pred, data, split_edge, evaluator, args.batch_size, args)
+            results_list = test_all((linklabeler, nodefeater), model, data, split_edge, evaluator, args.batch_size, args)
             results = results_list[0]
         else:
-            results = test(model, pred, data, split_edge, evaluator, args.batch_size, args)
+            results = test((linklabeler, nodefeater), model, data, split_edge, evaluator, args.batch_size, args)
         print(f'Test Time: {time.time() - st:.4f}')
         if best_results is None:
             best_results = {key: [0, 0, 0] for key in results}
@@ -348,7 +318,6 @@ def main():
                     if key == args.metric:
                         best_epoch = epoch
                         best_model = model.state_dict()
-                        best_pred = pred.state_dict()
                         print(f'Best_epoch: {best_epoch}')
             if epoch - best_epoch > 200:
                 break
@@ -360,7 +329,6 @@ def main():
                     if key == args.metric:
                         best_epoch = epoch
                         best_model = copy.deepcopy(model.state_dict())
-                        best_pred = copy.deepcopy(pred.state_dict())
                         print(f'Best_epoch: {best_epoch}')
                 print(f'Train: {train_hits:.4f}, Valid: {valid_hits:.4f}, Test: {test_hits:.4f}')
                 if key == args.metric:
@@ -373,8 +341,6 @@ def main():
 
     if args.test_mode:
         model.load_state_dict(best_model)
-        pred.load_state_dict(best_pred)
-
         if args.test_dataset == 'planetoid':
             for dataset in ['Cora', 'CiteSeer', 'PubMed']:
                 args.dataset = dataset

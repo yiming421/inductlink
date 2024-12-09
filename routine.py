@@ -4,10 +4,12 @@ from ogb.linkproppred import PygLinkPropPredDataset, Evaluator
 import torch
 from torch import nn
 from torch.nn import functional as F
+import torch_sparse
 
-def train(model, pred, optimizer, data, split_edge, args, clip_emb=False): # consider loss biased issue
+def train(feater, model, optimizer, data, split_edge, args, clip_emb=False): # consider loss biased issue
+    linklabeler, nodefeater = feater
     model.train()
-    pred.train()
+    
 
     pos_train_edge = split_edge['train']['edge'].to(data.x.device)
     pos_train_edge = pos_train_edge.t()
@@ -30,11 +32,17 @@ def train(model, pred, optimizer, data, split_edge, args, clip_emb=False): # con
             adj = data.adj_t
 
         optimizer.zero_grad()
-        h = model(data.x, adj)
         edge = pos_train_edge[:, perm]
-        pos_out = pred(h[edge[0]], h[edge[1]])
-        edge = neg_edge[:, perm]
-        neg_out = pred(h[edge[0]], h[edge[1]])
+        num_pos = edge.shape[1]
+        edge = torch.concat((edge, neg_edge[:, perm]), dim=-1)
+
+        
+        deg = torch_sparse.sum(adj, dim=-1).clamp_min_(1).float().reshape(-1, 1)
+        linklabel = linklabeler(edge, adj, deg)
+        nodefeat = nodefeater(data.x, edge, adj, deg)
+
+        out = model(linklabel, nodefeat)
+        pos_out, neg_out = out[:num_pos], out[num_pos:]
         if args.loss_fn == 'bce':
             pos_loss = -F.logsigmoid(pos_out).mean()
             neg_loss = -F.logsigmoid(-neg_out).mean()
@@ -43,13 +51,10 @@ def train(model, pred, optimizer, data, split_edge, args, clip_emb=False): # con
             loss = torch.square(1 - (pos_out - neg_out)).sum()
         loss.backward()
 
-        nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
-        nn.utils.clip_grad_norm_(pred.parameters(), args.clip_grad_norm)
-        if clip_emb:
-            nn.utils.clip_grad_norm_(data.x, args.clip_grad_norm)
-
+        nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_norm)        
         optimizer.step()
         tot_loss.append(loss.item())
+        print(tot_loss[-1])
     return sum(tot_loss) / len(tot_loss)
 
 def train_multiple(model, pred, optimizer, data, split_edge, args, clip_emb=False):
@@ -60,9 +65,9 @@ def train_multiple(model, pred, optimizer, data, split_edge, args, clip_emb=Fals
     return tot_loss / len(data)
 
 @torch.no_grad()
-def test(model, pred, data, split_edge, evaluator, batch_size, args):
+def test(feater, model, data, split_edge, evaluator, batch_size, args):
+    linklabeler, nodefeater = feater
     model.eval()
-    pred.eval()
 
     pos_train_edge = split_edge['train']['edge'].to(data.x.device).t()
     pos_valid_edge = split_edge['valid']['edge'].to(data.x.device).t()
@@ -70,40 +75,41 @@ def test(model, pred, data, split_edge, evaluator, batch_size, args):
     neg_valid_edge = split_edge['valid']['edge_neg'].to(data.x.device).t()
     neg_test_edge = split_edge['test']['edge_neg'].to(data.x.device).t()
 
-    h = model(data.x, data.adj_t)
+    deg = torch_sparse.sum(data.adj_t, dim=-1).clamp_min_(1).float().reshape(-1, 1)
+
     pos_train_pred = []
     loader = torch.utils.data.DataLoader(range(pos_train_edge.shape[1]), batch_size=batch_size, shuffle=False)
     for perm in loader:
         edge = pos_train_edge[:, perm]
-        pos_train_pred.append(pred(h[edge[0]], h[edge[1]]).cpu())
+        pos_train_pred.append(model(linklabeler(edge, data.adj_t, deg), nodefeater(data.x, edge, data.adj_t, deg)).squeeze().cpu())
     pos_train_pred = torch.cat(pos_train_pred, dim=0)
 
     pos_valid_pred = []
     loader = torch.utils.data.DataLoader(range(pos_valid_edge.shape[1]), batch_size=batch_size, shuffle=False)
     for perm in loader:
         edge = pos_valid_edge[:, perm]
-        pos_valid_pred.append(pred(h[edge[0]], h[edge[1]]).cpu())
+        pos_valid_pred.append(model(linklabeler(edge, data.adj_t, deg), nodefeater(data.x, edge, data.adj_t, deg)).squeeze().cpu())
     pos_valid_pred = torch.cat(pos_valid_pred, dim=0)
 
     neg_valid_pred = []
     loader = torch.utils.data.DataLoader(range(neg_valid_edge.shape[1]), batch_size=batch_size, shuffle=False)
     for perm in loader:
         edge = neg_valid_edge[:, perm]
-        neg_valid_pred.append(pred(h[edge[0]], h[edge[1]]).cpu())
+        neg_valid_pred.append(model(linklabeler(edge, data.adj_t, deg), nodefeater(data.x, edge, data.adj_t, deg)).squeeze().cpu())
     neg_valid_pred = torch.cat(neg_valid_pred, dim=0)
 
     pos_test_pred = []
     loader = torch.utils.data.DataLoader(range(pos_test_edge.shape[1]), batch_size=batch_size, shuffle=False)
     for perm in loader:
         edge = pos_test_edge[:, perm]
-        pos_test_pred.append(pred(h[edge[0]], h[edge[1]]).cpu())
+        pos_test_pred.append(model(linklabeler(edge, data.adj_t, deg), nodefeater(data.x, edge, data.adj_t, deg)).squeeze().cpu())
     pos_test_pred = torch.cat(pos_test_pred, dim=0)
 
     neg_test_pred = []
     loader = torch.utils.data.DataLoader(range(neg_test_edge.shape[1]), batch_size=batch_size, shuffle=False)
     for perm in loader:
         edge = neg_test_edge[:, perm]
-        neg_test_pred.append(pred(h[edge[0]], h[edge[1]]).cpu())
+        neg_test_pred.append(model(linklabeler(edge, data.adj_t, deg), nodefeater(data.x, edge, data.adj_t, deg)).squeeze().cpu())
     neg_test_pred = torch.cat(neg_test_pred, dim=0)
 
     results = {}
