@@ -8,7 +8,7 @@ import scipy.sparse as ssp
 from torch_geometric.data import Data
 import numpy as np
 
-def random_split_edges(data, val_ratio=0.05, test_ratio=0.1):
+def random_split_edges(data, val_ratio=0.1, test_ratio=0.2):
     result = train_test_split_edges(data, val_ratio=val_ratio, test_ratio=test_ratio)
 
     split_edge = {'train': {}, 'valid': {}, 'test': {}}
@@ -20,6 +20,7 @@ def random_split_edges(data, val_ratio=0.05, test_ratio=0.1):
     return split_edge
 
 def load_data(dataset):
+    name = dataset
     if dataset in ['Cora', 'CiteSeer', 'PubMed']:
         dataset = Planetoid(root='dataset', name=dataset)
     elif dataset in ['CS', 'Physics']:
@@ -29,17 +30,19 @@ def load_data(dataset):
     data = dataset[0]
     split_edge = random_split_edges(data)
     data.edge_index = to_undirected(split_edge['train']['edge'].t())
-    data.edge_index = add_self_loops(data.edge_index, num_nodes=data.num_nodes)[0]
+    #data.edge_index = add_self_loops(data.edge_index, num_nodes=data.num_nodes)[0]
     data.num_nodes = data.x.shape[0]
     data.edge_weight = None
     data.adj_t = SparseTensor.from_edge_index(data.edge_index, sparse_sizes=(data.num_nodes, data.num_nodes))
     data.adj_t = data.adj_t.to_symmetric().coalesce()
+    data.name = name
     return data, split_edge
 
-def load_ogbl_data(dataset_name):
+def load_ogbl_data(dataset_name): 
+    name = dataset_name
     dataset = PygLinkPropPredDataset(name=dataset_name)
     data = dataset[0]
-    data.edge_index = add_self_loops(data.edge_index, num_nodes=data.num_nodes)[0]
+    # data.edge_index = add_self_loops(data.edge_index, num_nodes=data.num_nodes)[0]
     data.edge_weight = None
     data.adj_t = SparseTensor.from_edge_index(data.edge_index, sparse_sizes=(data.num_nodes, data.num_nodes))
     data.adj_t = data.adj_t.to_symmetric().coalesce()
@@ -51,15 +54,16 @@ def load_ogbl_data(dataset_name):
         split_edge['train']['weight'] = split_edge['train']['weight'][selected_year_index]
         split_edge['train']['year'] = split_edge['train']['year'][selected_year_index]
 
-        full_edge_index = torch.cat([split_edge['valid']['edge'].t(), split_edge['train']['edge'].t()], dim=-1)
-        full_edge_weight = torch.cat([split_edge['train']['weight'], split_edge['valid']['weight']], dim=-1)
+        data.edge_index = to_undirected(split_edge['train']['edge'].t())
+        # data.edge_index = add_self_loops(edge, num_nodes=data.num_nodes)[0]
+        data.adj_t = SparseTensor.from_edge_index(data.edge_index, sparse_sizes=(data.num_nodes, data.num_nodes))
 
-        new_edges = to_undirected(full_edge_index, full_edge_weight, reduce='add')
-        new_edge_index, new_edge_weight = new_edges[0], new_edges[1]
-        data.adj_t = SparseTensor(row=new_edge_index[0],
-                                    col=new_edge_index[1],
-                                    value=new_edge_weight.to(torch.float32))
-        data.edge_index = new_edge_index
+        full_edge_index = torch.cat([split_edge['valid']['edge'].t(), split_edge['train']['edge'].t()], dim=-1)
+        full_edge_index = to_undirected(full_edge_index)
+        # full_edge_index = add_self_loops(full_edge_index, num_nodes=data.num_nodes)[0]
+        data.full_adj_t = SparseTensor.from_edge_index(full_edge_index, sparse_sizes=(data.num_nodes, data.num_nodes))
+    data.name = name
+        
     return data, split_edge
 
 def load_other_data(dataset):
@@ -70,13 +74,13 @@ def load_other_data(dataset):
     edge_index = torch.tensor(np.array([row, col]), dtype=torch.long)
     data = Data(edge_index=edge_index)
     data.num_nodes = net.shape[0]
-    print('Number of nodes:', data.num_nodes)
-    print('Number of edges:', edge_index.shape[1])
+    print('Number of nodes:', data.num_nodes, flush=True)
+    print('Number of edges:', edge_index.shape[1], flush=True)
     split_edge = random_split_edges(data)
 
     data.edge_index = to_undirected(split_edge['train']['edge'].t())
     data.x = degree(data.edge_index[0], data.num_nodes).view(-1, 1).to(torch.float)
-    data.edge_index = add_self_loops(data.edge_index, num_nodes=data.num_nodes)[0]
+    # data.edge_index = add_self_loops(data.edge_index, num_nodes=data.num_nodes)[0]
     data.edge_weight = None
     data.adj_t = SparseTensor.from_edge_index(data.edge_index, sparse_sizes=(data.num_nodes, data.num_nodes))
     data.adj_t = data.adj_t.to_symmetric().coalesce()
@@ -86,20 +90,26 @@ def load_other_data(dataset):
 def load_all_train_data_no_feat():
     data_list = []
     split_edge_list = []
-    for dataset in ['Ecoli', 'Yeast', 'NS', 'PB', 'Power', 'USAir', 'Celegans']:
-        if dataset == 'ogbl-ppa':
-            data, split_edge = load_ogbl_data('ogbl-ppa')
+    for dataset in ['Ecoli', 'Yeast', 'NS', 'PB', 'Power', 'USAir', 'Celegans', 'Cora', 'CiteSeer', 'PubMed', 'CS', 'Physics', 'Computers', 'Photo', 'ogbl-collab']:
+        if dataset.startswith('ogbl'):
+            data, split_edge = load_ogbl_data(dataset)
+        elif dataset in ['Cora', 'CiteSeer', 'PubMed', 'CS', 'Physics', 'Computers', 'Photo']:
+            data, split_edge = load_data(dataset)
         else:
             data, split_edge = load_other_data(dataset)
         data_list.append(data)
         split_edge_list.append(split_edge)
     return data_list, split_edge_list
 
-def load_all_train_data_feat():
+def load_all_train_data_feat(train_datasets):
     data_list = []
     split_edge_list = []
-    for dataset in ['Cora', 'CiteSeer', 'PubMed', 'CS', 'Physics', 'Computers', 'Photo']:
-        data, split_edge = load_data(dataset)
+    for dataset in train_datasets:
+        print(dataset, flush=True)
+        if dataset.startswith('ogbl'):
+            data, split_edge = load_ogbl_data(dataset)
+        else:
+            data, split_edge = load_data(dataset)
         data_list.append(data)
         split_edge_list.append(split_edge)
     return data_list, split_edge_list
